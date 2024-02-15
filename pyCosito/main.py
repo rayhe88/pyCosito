@@ -4,13 +4,18 @@ from fireworks import Firework, LaunchPad, ScriptTask, FWorker, Workflow, FileTr
 from fireworks.core.firework import FiretaskBase, FWAction
 from fireworks.utilities.fw_utilities import explicit_serialize
 
+from pyCosito.multi_launcher import launch_multiprocess2
+from pyCosito.polaris import createCommand
+from pyCosito.polaris import createFWorkers
 
-from xtb.ase.calculator import XTB
+
 from ase import Atoms
 from ase.collections import g2
 import numpy as np
 import pymongo
 import os
+from copy import deepcopy
+from importlib import import_module
 
 import logging
 
@@ -27,6 +32,17 @@ logging.basicConfig(format='%(levelname)s')
 
 
 # Utils functions
+
+def name_to_ase_software(software_name):
+    if software_name == "XTB":
+        module = import_module("xtb.ase.calculator")
+        return getattr(module, software_name)
+    elif software_name == "PWDFT":
+        module = import_module("pyCosito.ase_pwdft.pwdft")
+        return getattr(module, software_name)
+    else:
+        module = import_module("ase.calculators."+software_name.lower())
+        return getattr(module, software_name)
 
 # insertar_atom
 def insertar_atom(colection, label):
@@ -66,16 +82,22 @@ def llenamos_atms_db(colection, listName):
     for item in listName:
         insertar_atom(colection, item)
 
-
+#-----------------------------------------------------------------------------------
+#
+#                     CLASS for Energy Calculation in FW
+#
+#-----------------------------------------------------------------------------------
 
 class EnergyTask(FiretaskBase):
     def run_task(self, fw_spec):
         raise NotImplementedError
 
-def getEnergybyFW(mongoConf, label, stype, parents=[]):
+def getEnergybyFW(mongoConf, label, stype, software, software_kwargs={}, parents=[]):
     d = dict(mongoConf)
     d["label"] = label
     d["stype"] = stype
+    d["software"] = software
+    if software_kwargs: d["software_kwargs"] = software_kwargs
 
     t1 = EnergyTaskFW(d)
     return Firework(t1, name=label+"_energy", spec={"_priority":1})
@@ -92,6 +114,12 @@ class EnergyTaskFW(EnergyTask):
         dbMolec = self["dbMolec"]
         label = self["label"]
         stype = self["stype"]
+        software_kwargs = deepcopy(self["software_kwargs"]) if "software_kwargs" in self.keys() else dict()
+
+        software = name_to_ase_software(self["software"])
+
+        if self["software"] == "Espresso" or self["software"] == "PWDFT":
+            software_kwargs["command"] = createCommand(fw_spec["_fw_env"]["host"], self["software"])
 
 
         client = pymongo.MongoClient(f"mongodb://{host}:{port}/")
@@ -103,7 +131,7 @@ class EnergyTaskFW(EnergyTask):
 
         symb, xyz = localize_xyz(colection,label)
         molecule = Atoms(''.join(symb), positions=xyz)
-        molecule.calc = XTB(method='GFN1-xTB')
+        molecule.calc = software(**software_kwargs)
         molecule.set_cell([13.0, 14.0, 15.0])
         molecule.set_pbc([1,1,1])
         molecule.center()
@@ -124,13 +152,11 @@ class AtomizationWorkFlow:
         self.path = path
         self.software = software
         self.nworkers = nworkers
-        self.sofware_kwargs = software_kwargs
+        self.software_kwargs = software_kwargs
         self.moleculeList = moleculeList
         self.nmolecule = len(self.moleculeList)
         self.atomList = self.initAtomList()
         self.natom = len(self.atomList)
-        self.launchpad = LaunchPad()
-        self.launchpad.reset('', require_password=False)
         if name == None:
             self.name = "AtomizationWorkFlow"
         else:
@@ -147,6 +173,9 @@ class AtomizationWorkFlow:
                           "nameDB" : self.nameDB,
                           "dbAtoms" : self.dbAtoms,
                           "dbMolec" : self.dbMolec}
+
+        self.launchpad = LaunchPad(host=self.host, port=self.port)
+        self.launchpad.reset('', require_password=False)
 
         client = pymongo.MongoClient(f"mongodb://{self.host}:{self.port}/")
         db = client[self.nameDB]
@@ -204,14 +233,15 @@ class AtomizationWorkFlow:
 
         print(" ATOMS")
         for atom in self.atomList:
-            task = getEnergybyFW(self.mongoConf, atom, stype="ATOM")
+
+            task = getEnergybyFW(self.mongoConf, atom, stype="ATOM", software=self.software, software_kwargs=self.software_kwargs)
             fws1.append(task)
 
         fws.extend(fws1)
 
         print(" Molecules")
         for mol in self.moleculeList:
-            task = getEnergybyFW(self.mongoConf, mol, stype="MOLECULE", parents=fws1)
+            task = getEnergybyFW(self.mongoConf, mol, stype="MOLECULE", software=self.software, software_kwargs=self.software_kwargs, parents=fws1)
             fws2.append(task)
 
         fws.extend(fws2)
@@ -221,6 +251,8 @@ class AtomizationWorkFlow:
 
         self.launch1()
 
+        print("Terminamos calculos")
+        print("Evaluamos Energias de atomizacion")
 
         self.GetAtomizationEnergy()
 
@@ -228,5 +260,7 @@ class AtomizationWorkFlow:
         if self.nworkers == 1:
             rapidfire(self.launchpad, FWorker())
         else:
-            launch_multiprocess(self.launchpad, FWorker(), "Error", 0, self.nworkers, 5, local_redirect=False)
+            print(" Multiple Fireworkers")
+            listfworkers = createFWorkers(self.nworkers)
+            launch_multiprocess2(self.launchpad, listfworkers, "INFO", 0, self.nworkers, 5, local_redirect=False)
 
